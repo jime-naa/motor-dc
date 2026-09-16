@@ -1,0 +1,6 @@
+{
+  "name": "ESP32 BLE Motor Controller & Studio",
+  "description": "Controlador y suite móvil para motor DC con ESP32 y puente H L298N vía Bluetooth Low Energy (BLE), con Web BLE en vivo, simulador de hardware y código para MIT App Inventor, Flutter, Kotlin y React Native.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
