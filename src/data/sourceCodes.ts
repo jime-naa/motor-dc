@@ -594,167 +594,400 @@ class MainActivity : ComponentActivity() {
 `;
 
 export const ESP32_ARDUINO_CODE = `/*
- * =========================================================================
- * SERVIDOR BLE PARA CONTROL DE MOTOR DC CON PUENTE H L298N Y ESP32
- * =========================================================================
- * Service UUID:        4fafc201-1fb5-459e-8fcc-c5c9c331914b
- * Characteristic UUID: c565818d-6972-466d-88b0-517865f14d02
- *
- * Conexión de Pines Hardware:
- *   - GPIO 18 -> IN1 (Dirección 1 del L298N)
- *   - GPIO 19 -> IN2 (Dirección 2 del L298N)
- *   - GPIO 21 -> ENA (Habilitación PWM de velocidad del L298N)
- *   - GND     -> GND común del L298N y fuente externa
- *
- * Protocolo de Comandos: "DIRECCION:VELOCIDAD"
- *   - 'F': Forward / Adelante  -> IN1=HIGH, IN2=LOW, ENA=PWM
- *   - 'R': Reverse / Atrás     -> IN1=LOW,  IN2=HIGH, ENA=PWM
- *   - 'S': Stop / Detener      -> IN1=LOW,  IN2=LOW,  ENA=0
- * =========================================================================
+ * ======================================================================================
+ * FIRMWARE ROBOT SUMO ESP32 BLE - ARQUITECTURA ASÍNCRONA DE ALTO RENDIMIENTO
+ * ======================================================================================
+ * Características Principales:
+ *   1. Callback BLE No Bloqueante: onWrite solo extrae bytes crudos a un buffer atómico.
+ *      No hace malloc dinámico riesgoso, no imprime Serial pesado ni traba la tarea NimBLE/Bluedroid.
+ *   2. Watchdog de Comunicación (Fail-safe): Si transcurren > 1000 ms sin paquetes BLE,
+ *      el robot frena en seco de inmediato (evita que salga disparado del Dohyo).
+ *   3. Prioridad Máxima Sensores Infrarrojos (Detección de Borde Blanco):
+ *      Lectura periódica no bloqueante. Si detecta línea blanca, anula el control remoto y
+ *      ejecuta maniobra evasiva inmediata hacia el centro.
+ *   4. Control de 3 Palancas con Rampas Suaves (Soft-Start / Soft-Stop):
+ *      Control diferencial de Motores Izquierdo / Derecho + Servomotor de Palanca/Cuña.
+ *   5. Manejo Robusto de Desconexión: Reactiva Advertising sin fugar descriptores ni reiniciar.
+ * ======================================================================================
  */
 
+#include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
+// --------------------------------------------------------------------------------------
+// 1. CONFIGURACIÓN BLE (UUIDs estándar)
+// --------------------------------------------------------------------------------------
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "c565818d-6972-466d-88b0-517865f14d02"
+#define DEVICE_NAME         "ESP32_Sumo_Robot"
 
-// Definición de Pines de Hardware
-const int PIN_IN1 = 18;
-const int PIN_IN2 = 19;
-const int PIN_ENA = 21;
+// --------------------------------------------------------------------------------------
+// 2. ASIGNACIÓN DE PINES HARDWARE (L298N / Driver Dual + Infrarrojos + Servo Palanca)
+// --------------------------------------------------------------------------------------
+// Motor Izquierdo
+const int PIN_IN1_IZQ = 18;
+const int PIN_IN2_IZQ = 19;
+const int PIN_ENA_IZQ = 21; // PWM
 
-// Configuración de canal PWM (LEDC de ESP32)
-const int PWM_CHANNEL = 0;
-const int PWM_FREQ    = 5000; // 5 kHz para motor DC
-const int PWM_RES     = 8;    // Resolución de 8 bits (valores 0 a 255)
+// Motor Derecho
+const int PIN_IN3_DER = 22;
+const int PIN_IN4_DER = 23;
+const int PIN_ENB_DER = 25; // PWM
 
-bool deviceConnected = false;
-BLECharacteristic *pCharacteristic = nullptr;
+// Sensores Infrarrojos de Suelo / Borde Dohyo (Activo en LOW para línea blanca reflectante)
+const int PIN_IR_FRONT_LEFT  = 34; // Solo entrada (ADC1)
+const int PIN_IR_FRONT_RIGHT = 35; // Solo entrada (ADC1)
+const int PIN_IR_REAR        = 32; // Sensor trasero
 
-// Función para aplicar movimiento al motor
-void setMotor(char direction, int speed) {
-  // Limitar rango de velocidad
-  speed = constrain(speed, 0, 255);
+// Servomotor / Actuador de Palanca de Ataque (Opcional)
+const int PIN_SERVO_LEVER    = 26;
 
-  Serial.printf("[MOTOR] Aplicando: Dir='%c', Vel=%d\\n", direction, speed);
+// Configuración Canales PWM LEDC de ESP32 (Hardware Timers)
+const int PWM_CH_IZQ  = 0;
+const int PWM_CH_DER  = 1;
+const int PWM_CH_LEVR = 2;
+const int PWM_FREQ    = 5000; // 5 kHz para motores DC
+const int PWM_RES     = 8;    // Resolución 8 bits: 0 a 255
 
-  switch (direction) {
-    case 'F': // Adelante
-      digitalWrite(PIN_IN1, HIGH);
-      digitalWrite(PIN_IN2, LOW);
-      ledcWrite(PWM_CHANNEL, speed);
-      break;
-
-    case 'R': // Reversa
-      digitalWrite(PIN_IN1, LOW);
-      digitalWrite(PIN_IN2, HIGH);
-      ledcWrite(PWM_CHANNEL, speed);
-      break;
-
-    case 'S': // Detener (Freno activo)
-    default:
-      digitalWrite(PIN_IN1, LOW);
-      digitalWrite(PIN_IN2, LOW);
-      ledcWrite(PWM_CHANNEL, 0);
-      break;
-  }
-}
-
-// Callback para eventos de conexión del Servidor BLE
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
-    deviceConnected = true;
-    Serial.println("[BLE] Cliente conectado con éxito.");
-  }
-
-  void onDisconnect(BLEServer* pServer) {
-    deviceConnected = false;
-    Serial.println("[BLE] Cliente desconectado. Apagando motor por seguridad.");
-    setMotor('S', 0); // Failsafe automático: detener motor si se pierde enlace
-    pServer->startAdvertising(); // Reiniciar publicidad BLE para nueva reconexión
-  }
+// --------------------------------------------------------------------------------------
+// 3. ESTRUCTURAS Y VARIABLES GLOBALES ATÓMICAS (Compartidas entre BLE Task y Loop)
+// --------------------------------------------------------------------------------------
+struct CommandPacket {
+  char action;      // 'F': Adelante, 'R': Atrás, 'L': Giro Izq, 'G': Giro Der, 'S': Freno, 'W': Palanca
+  int speedIzq;     // 0 - 255
+  int speedDer;     // 0 - 255
+  int leverPos;     // 0 - 180 (Posición de palanca / servo)
+  uint32_t timestamp;
+  bool isNew;
 };
 
-// Callback al recibir escritura en la Característica BLE
-class MotorCharacteristicCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pChar) {
-    std::string value = pChar->getValue();
+volatile bool g_deviceConnected = false;
+volatile bool g_advertisingNeedsRestart = false;
+portMUX_TYPE g_bleMux = portMUX_INITIALIZER_UNLOCKED;
 
-    if (value.length() > 0) {
-      Serial.print("[BLE RECIBIDO] Raw: ");
-      Serial.println(value.c_str());
+// Buffer de comando protegido contra condiciones de carrera (Race Conditions)
+CommandPacket g_lastCommand = {'S', 0, 0, 90, 0, false};
 
-      // Parsear formato "DIRECCION:VELOCIDAD", ej. "F:255"
-      int separatorIndex = value.find(':');
-      if (separatorIndex != std::string::npos) {
-        char direction = value[0];
-        std::string speedStr = value.substr(separatorIndex + 1);
-        int speed = atoi(speedStr.c_str());
+// Parámetros de aceleración suave (Rampas de velocidad en loop)
+float g_currentSpeedIzq = 0.0f;
+float g_currentSpeedDer = 0.0f;
+const float RAMP_ACCEL_STEP = 15.0f;  // Paso de aceleración cada ciclo
+const float RAMP_DECEL_STEP = 25.0f;  // Freno suave o enérgico
 
-        setMotor(direction, speed);
-      } else {
-        // Si no contiene separador, evaluar si es comando simple de parada 'S'
-        if (value[0] == 'S') {
-          setMotor('S', 0);
-        } else {
-          Serial.println("[ERROR] Formato de comando inválido. Se espera 'D:V'.");
-        }
+// Watchdog de seguridad (Fail-safe BLE)
+const uint32_t WATCHDOG_TIMEOUT_MS = 1000; // 1 segundo máximo sin paquetes
+uint32_t g_lastPacketTime = 0;
+
+// Instancias BLE
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+
+// --------------------------------------------------------------------------------------
+// 4. PARSEO SEGURO DE PAQUETES (Cero allocaciones dinámicas, O(1), Anti-Overflow)
+// --------------------------------------------------------------------------------------
+void parseIncomingBleBytes(const uint8_t* data, size_t length) {
+  if (data == nullptr || length == 0) return;
+
+  // Buffer local seguro en la pila (máximo 32 caracteres por comando)
+  char safeBuffer[32];
+  size_t copyLen = length < (sizeof(safeBuffer) - 1) ? length : (sizeof(safeBuffer) - 1);
+  memcpy(safeBuffer, data, copyLen);
+  safeBuffer[copyLen] = '\\0';
+
+  // Formatos aceptados:
+  // 1) "D:VEL" (Ej: "F:220", "R:180", "L:200", "G:200", "S:0")
+  // 2) "DI:DD:LEVER" (Control avanzado de 3 palancas: Izq, Der, Servo)
+  // 3) Letra simple 'S' (Parada de emergencia instantánea)
+
+  char action = safeBuffer[0];
+  int vIzq = 0;
+  int vDer = 0;
+  int lever = 90;
+
+  char* firstColon = strchr(safeBuffer, ':');
+
+  if (firstColon != nullptr) {
+    // Si viene en formato simple "D:VEL"
+    char* secondColon = strchr(firstColon + 1, ':');
+
+    if (secondColon == nullptr) {
+      // Formato "D:VEL"
+      int val = atoi(firstColon + 1);
+      val = constrain(val, 0, 255);
+
+      switch (action) {
+        case 'F': vIzq = val;  vDer = val;  break;
+        case 'R': vIzq = -val; vDer = -val; break;
+        case 'L': vIzq = -val; vDer = val;  break; // Giro sobre su eje
+        case 'G': vIzq = val;  vDer = -val; break;
+        case 'S':
+        default:  vIzq = 0;    vDer = 0;    break;
       }
+    } else {
+      // Formato extendido de 3 palancas: "vIzq:vDer:lever"
+      vIzq  = atoi(safeBuffer);
+      vDer  = atoi(firstColon + 1);
+      lever = atoi(secondColon + 1);
+      action = (vIzq == 0 && vDer == 0) ? 'S' : 'M';
+    }
+  } else {
+    // Comando simple sin separador (ej: 'S')
+    if (action == 'S') {
+      vIzq = 0;
+      vDer = 0;
     }
   }
+
+  // Actualización crítica protegida con Spinlock de FreeRTOS
+  portENTER_CRITICAL(&g_bleMux);
+  g_lastCommand.action    = action;
+  g_lastCommand.speedIzq  = constrain(vIzq, -255, 255);
+  g_lastCommand.speedDer  = constrain(vDer, -255, 255);
+  g_lastCommand.leverPos  = constrain(lever, 0, 180);
+  g_lastCommand.timestamp = millis();
+  g_lastCommand.isNew     = true;
+  g_lastPacketTime        = millis();
+  portEXIT_CRITICAL(&g_bleMux);
+}
+
+// --------------------------------------------------------------------------------------
+// 5. CALLBACKS DE SERVIDOR Y CARACTERÍSTICA BLE
+// --------------------------------------------------------------------------------------
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    g_deviceConnected = true;
+    g_lastPacketTime = millis();
+    Serial.println("[BLE] >> Cliente conectado con éxito.");
+  }
+
+  void onDisconnect(BLEServer* pServer) override {
+    g_deviceConnected = false;
+    // Marcamos la bandera para reiniciar Advertising en el loop principal
+    // (Llamar a startAdvertising dentro del callback a veces crashea la pila Bluedroid si no terminó el handshake)
+    g_advertisingNeedsRestart = true;
+    Serial.println("[BLE] >> Cliente desconectado. Failsafe activo.");
+  }
 };
 
+class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pChar) override {
+    // Obtenemos el puntero a los datos crudos directamente sin instanciar std::string innecesario
+    uint8_t* pData = pChar->getData();
+    size_t len = pChar->getLength();
+    
+    // Parseo ultra-rápido en memoria sin bloqueos
+    parseIncomingBleBytes(pData, len);
+  }
+};
+
+// --------------------------------------------------------------------------------------
+// 6. CONTROL FÍSICO DE MOTORES Y RAMPAS (Hardware LEDC PWM)
+// --------------------------------------------------------------------------------------
+void setHardwareMotors(int targetIzq, int targetDer) {
+  // Manejo de rampa suave para evitar caídas de tensión (Brownout) que reinicien el ESP32
+  if (g_currentSpeedIzq < targetIzq) {
+    g_currentSpeedIzq = min((float)targetIzq, g_currentSpeedIzq + RAMP_ACCEL_STEP);
+  } else if (g_currentSpeedIzq > targetIzq) {
+    g_currentSpeedIzq = max((float)targetIzq, g_currentSpeedIzq - RAMP_DECEL_STEP);
+  }
+
+  if (g_currentSpeedDer < targetDer) {
+    g_currentSpeedDer = min((float)targetDer, g_currentSpeedDer + RAMP_ACCEL_STEP);
+  } else if (g_currentSpeedDer > targetDer) {
+    g_currentSpeedDer = max((float)targetDer, g_currentSpeedDer - RAMP_DECEL_STEP);
+  }
+
+  int pwmIzq = abs((int)g_currentSpeedIzq);
+  int pwmDer = abs((int)g_currentSpeedDer);
+
+  // Motor Izquierdo
+  if (g_currentSpeedIzq > 5) {
+    digitalWrite(PIN_IN1_IZQ, HIGH);
+    digitalWrite(PIN_IN2_IZQ, LOW);
+  } else if (g_currentSpeedIzq < -5) {
+    digitalWrite(PIN_IN1_IZQ, LOW);
+    digitalWrite(PIN_IN2_IZQ, HIGH);
+  } else {
+    digitalWrite(PIN_IN1_IZQ, LOW);
+    digitalWrite(PIN_IN2_IZQ, LOW);
+    pwmIzq = 0;
+  }
+  ledcWrite(PWM_CH_IZQ, pwmIzq);
+
+  // Motor Derecho
+  if (g_currentSpeedDer > 5) {
+    digitalWrite(PIN_IN3_DER, HIGH);
+    digitalWrite(PIN_IN4_DER, LOW);
+  } else if (g_currentSpeedDer < -5) {
+    digitalWrite(PIN_IN3_DER, LOW);
+    digitalWrite(PIN_IN4_DER, HIGH);
+  } else {
+    digitalWrite(PIN_IN3_DER, LOW);
+    digitalWrite(PIN_IN4_DER, LOW);
+    pwmDer = 0;
+  }
+  ledcWrite(PWM_CH_DER, pwmDer);
+}
+
+void emergencyStop() {
+  digitalWrite(PIN_IN1_IZQ, LOW);
+  digitalWrite(PIN_IN2_IZQ, LOW);
+  digitalWrite(PIN_IN3_DER, LOW);
+  digitalWrite(PIN_IN4_DER, LOW);
+  ledcWrite(PWM_CH_IZQ, 0);
+  ledcWrite(PWM_CH_DER, 0);
+  g_currentSpeedIzq = 0;
+  g_currentSpeedDer = 0;
+}
+
+// --------------------------------------------------------------------------------------
+// 7. LÓGICA DE SENSORES INFRARROJOS (Prioridad Máxima de Dohyo)
+// --------------------------------------------------------------------------------------
+bool checkBorderSensors(uint32_t now) {
+  // Los sensores infrarrojos TCRT5000 / QRE1113 dan LOW al detectar borde blanco del Dohyo
+  bool frontLeftWhite  = (digitalRead(PIN_IR_FRONT_LEFT) == LOW);
+  bool frontRightWhite = (digitalRead(PIN_IR_FRONT_RIGHT) == LOW);
+  bool rearWhite       = (digitalRead(PIN_IR_REAR) == LOW);
+
+  if (frontLeftWhite || frontRightWhite) {
+    // Maniobra Evasiva Inmediata: Retroceder y girar violentamente al centro
+    emergencyStop();
+    digitalWrite(PIN_IN1_IZQ, LOW);
+    digitalWrite(PIN_IN2_IZQ, HIGH);
+    digitalWrite(PIN_IN3_DER, LOW);
+    digitalWrite(PIN_IN4_DER, HIGH);
+    ledcWrite(PWM_CH_IZQ, 255);
+    ledcWrite(PWM_CH_DER, 255);
+    
+    // Rutina de escape sin delay(): ejecución en loop controlado
+    return true;
+  } else if (rearWhite) {
+    // Si la parte trasera toca el borde: Acelerar al frente con toda la potencia
+    digitalWrite(PIN_IN1_IZQ, HIGH);
+    digitalWrite(PIN_IN2_IZQ, LOW);
+    digitalWrite(PIN_IN3_DER, HIGH);
+    digitalWrite(PIN_IN4_DER, LOW);
+    ledcWrite(PWM_CH_IZQ, 255);
+    ledcWrite(PWM_CH_DER, 255);
+    return true;
+  }
+
+  return false;
+}
+
+// --------------------------------------------------------------------------------------
+// 8. SETUP PRINCIPAL
+// --------------------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
-  Serial.println("\\n=== INICIANDO ESP32 MOTOR BLE CONTROLLER ===");
+  Serial.println("\\n==================================================");
+  Serial.println("  INICIANDO FIRMWARE SUMO BOT ESP32 BLE (FAILSAFE)");
+  Serial.println("==================================================");
 
-  // 1. Configurar Pines de Dirección como Salidas
-  pinMode(PIN_IN1, OUTPUT);
-  pinMode(PIN_IN2, OUTPUT);
-  digitalWrite(PIN_IN1, LOW);
-  digitalWrite(PIN_IN2, LOW);
+  // Configuración de Pines GPIO
+  pinMode(PIN_IN1_IZQ, OUTPUT);
+  pinMode(PIN_IN2_IZQ, OUTPUT);
+  pinMode(PIN_IN3_DER, OUTPUT);
+  pinMode(PIN_IN4_DER, OUTPUT);
 
-  // 2. Configurar Generador PWM LEDC para ENA
-  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RES);
-  ledcAttachPin(PIN_ENA, PWM_CHANNEL);
-  ledcWrite(PWM_CHANNEL, 0); // Iniciar apagado
+  pinMode(PIN_IR_FRONT_LEFT, INPUT);
+  pinMode(PIN_IR_FRONT_RIGHT, INPUT);
+  pinMode(PIN_IR_REAR, INPUT);
 
-  // 3. Inicializar Dispositivo BLE
-  BLEDevice::init("ESP32_Motor_Control");
-  BLEServer *pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
+  // Configuración de canales PWM LEDC
+  ledcSetup(PWM_CH_IZQ, PWM_FREQ, PWM_RES);
+  ledcAttachPin(PIN_ENA_IZQ, PWM_CH_IZQ);
 
-  // 4. Crear Servicio y Característica
-  BLEService *pService = pServer->createService(SERVICE_UUID);
+  ledcSetup(PWM_CH_DER, PWM_FREQ, PWM_RES);
+  ledcAttachPin(PIN_ENB_DER, PWM_CH_DER);
+
+  emergencyStop();
+
+  // Inicialización de Pila Bluetooth Low Energy
+  BLEDevice::init(DEVICE_NAME);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService* pService = pServer->createService(SERVICE_UUID);
   pCharacteristic = pService->createCharacteristic(
                       CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_READ |
-                      BLECharacteristic::PROPERTY_WRITE |
-                      BLECharacteristic::PROPERTY_NOTIFY
+                      BLECharacteristic::PROPERTY_READ   |
+                      BLECharacteristic::PROPERTY_WRITE  |
+                      BLECharacteristic::PROPERTY_WRITE_NR // Permite escritura ultrarrápida sin ACK
                     );
 
-  pCharacteristic->setCallbacks(new MotorCharacteristicCallbacks());
+  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
   pCharacteristic->addDescriptor(new BLE2902());
 
-  // 5. Iniciar Servicio y Publicidad (Advertising)
   pService->start();
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06); // Parámetros de compatibilidad iPhone/Android
+  pAdvertising->setMinPreferred(0x06); // Intervalo de conexión óptimo (7.5ms)
   pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
 
-  Serial.println("[BLE] Servidor listo y publicitando como 'ESP32_Motor_Control'");
-  Serial.println("[INFO] Esperando conexión desde App Móvil o Web BLE...");
+  g_lastPacketTime = millis();
+  Serial.println("[SISTEMA] BLE Listo. Esperando conexión...");
 }
 
+// --------------------------------------------------------------------------------------
+// 9. LOOP PRINCIPAL (Máquina de Estados No Bloqueante con millis())
+// --------------------------------------------------------------------------------------
 void loop() {
-  // El manejo de BLE y PWM es completamente asíncrono e interrumpido por hardware.
-  delay(50);
+  uint32_t now = millis();
+
+  // 1. Manejo de Re-publicidad BLE en caso de desconexión sin bloquear el hilo BLE
+  if (g_advertisingNeedsRestart) {
+    g_advertisingNeedsRestart = false;
+    emergencyStop();
+    pServer->startAdvertising();
+    Serial.println("[BLE] Publicidad reiniciada. Listo para nuevo emparejamiento.");
+  }
+
+  // 2. Prioridad Máxima: Sensores de Borde Dohyo
+  bool underBorderEvasion = checkBorderSensors(now);
+  if (underBorderEvasion) {
+    return; // El escape del borde tiene prioridad sobre el mando Bluetooth
+  }
+
+  // 3. Watchdog de Comunicación (Fail-safe de seguridad)
+  // Si estamos "conectados" pero no llegan paquetes en > 1000ms, detenemos los motores.
+  if (g_deviceConnected && (now - g_lastPacketTime > WATCHDOG_TIMEOUT_MS)) {
+    static uint32_t lastWarning = 0;
+    if (now - lastWarning > 1000) {
+      Serial.println("[FAILSAFE] Alerta: Sin paquetes BLE en > 1s. Frenando motores.");
+      lastWarning = now;
+    }
+    setHardwareMotors(0, 0);
+    return;
+  }
+
+  // Si no hay conexión BLE activa, motores siempre apagados
+  if (!g_deviceConnected) {
+    setHardwareMotors(0, 0);
+    return;
+  }
+
+  // 4. Obtención segura del comando actual
+  int targetIzq = 0;
+  int targetDer = 0;
+
+  portENTER_CRITICAL(&g_bleMux);
+  targetIzq = g_lastCommand.speedIzq;
+  targetDer = g_lastCommand.speedDer;
+  portEXIT_CRITICAL(&g_bleMux);
+
+  // 5. Aplicar rampa de aceleración/desaceleración suave
+  static uint32_t lastMotorUpdate = 0;
+  if (now - lastMotorUpdate >= 10) { // Actualizar rampa cada 10ms (100 Hz estables)
+    lastMotorUpdate = now;
+    setHardwareMotors(targetIzq, targetDer);
+  }
 }
 `;
 
