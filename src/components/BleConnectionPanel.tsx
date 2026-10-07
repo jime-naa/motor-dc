@@ -149,53 +149,52 @@ export const BleConnectionPanel: React.FC<Props> = ({
                 className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-rose-300 border border-slate-700 text-sm font-medium flex items-center gap-2 transition-colors cursor-pointer"
               >
                 <Power className="w-4 h-4" />
-                <span>Desconectar {deviceState.isSimulated ? 'Simulador' : 'BLE'}</span>
+                <span>Desconectar {deviceState.isSimulated ? 'Simulador' : 'ESP32'}</span>
               </button>
 
-              {deviceState.isSimulated && (
+              {deviceState.isSimulated ? (
                 <button
                   id="btn-cambiar-a-real"
                   onClick={onConnectReal}
-                  className="px-4 py-2.5 rounded-xl bg-indigo-600/80 hover:bg-indigo-600 text-indigo-100 text-sm font-medium flex items-center gap-2 transition-colors cursor-pointer"
+                  disabled={isScanning || isConnecting}
+                  className="px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold flex items-center gap-2 transition-colors cursor-pointer shadow-md disabled:opacity-50"
                 >
                   <Bluetooth className="w-4 h-4" />
-                  <span>Probar Conectar ESP32 Físico</span>
+                  <span>Conectar ESP32 Real por Bluetooth</span>
                 </button>
-              )}
-
-              {!deviceState.isSimulated && (
+              ) : (
                 <button
                   id="btn-volver-a-simulador"
                   onClick={onConnectSimulator}
                   className="px-4 py-2.5 rounded-xl bg-purple-950/60 hover:bg-purple-900/80 text-purple-200 border border-purple-800/60 text-sm font-medium flex items-center gap-2 transition-colors cursor-pointer"
                 >
                   <PlayCircle className="w-4 h-4" />
-                  <span>Cambiar a Simulador Virtual</span>
+                  <span>Modo Simulación Virtual</span>
                 </button>
               )}
             </div>
           ) : (
-            <>
-              <button
-                id="btn-activar-simulador"
-                onClick={onConnectSimulator}
-                disabled={isScanning || isConnecting}
-                className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold flex items-center gap-2 transition-all cursor-pointer shadow-lg shadow-indigo-950/40 disabled:opacity-50"
-              >
-                <PlayCircle className="w-4 h-4" />
-                <span>Activar Simulador Virtual (Recomendado)</span>
-              </button>
-
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 id="btn-conectar-esp32-real"
                 onClick={onConnectReal}
                 disabled={isScanning || isConnecting}
+                className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-semibold flex items-center gap-2 transition-all cursor-pointer shadow-lg shadow-indigo-950/40 disabled:opacity-50"
+              >
+                <Bluetooth className="w-4 h-4" />
+                <span>{isScanning ? 'Buscando ESP32...' : isConnecting ? 'Conectando...' : 'Conectar ESP32 (Bluetooth)'}</span>
+              </button>
+
+              <button
+                id="btn-activar-simulador"
+                onClick={onConnectSimulator}
+                disabled={isScanning || isConnecting}
                 className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-sm font-medium flex items-center gap-2 transition-colors cursor-pointer disabled:opacity-50"
               >
-                <Bluetooth className="w-4 h-4 text-indigo-400" />
-                <span>Escanear ESP32 Real</span>
+                <PlayCircle className="w-4 h-4 text-purple-400" />
+                <span>Usar Simulador Virtual</span>
               </button>
-            </>
+            </div>
           )}
         </div>
 

@@ -30,7 +30,7 @@ export class BleService {
 
   public async connectRealDevice(): Promise<boolean> {
     if (!this.isWebBleAvailable()) {
-      const msg = 'Web Bluetooth API no está disponible en este navegador o entorno. Usa Google Chrome en Android, Windows o Mac (abierto directamente en una pestaña), o activa el modo Simulación.';
+      const msg = 'Web Bluetooth no está habilitado o disponible en este navegador. Asegúrate de usar Chrome o Edge en Android, Windows o Mac abriendo la app directamente (no dentro de un visor web restringido).';
       console.warn(msg);
       this.onStatusChangeCallback?.('error', msg);
       return false;
@@ -38,42 +38,100 @@ export class BleService {
 
     try {
       this.simulated = false;
-      this.onStatusChangeCallback?.('scanning', 'Buscando "ESP32_Motor_Control"...');
+      this.onStatusChangeCallback?.('scanning', 'Buscando dispositivos Bluetooth cercanos...');
 
-      // Request device with name or service filter
-      const device = await (navigator as any).bluetooth.requestDevice({
-        filters: [
-          { name: DEFAULT_CONFIG.advertisedName },
-          { namePrefix: 'ESP32' },
-          { services: [DEFAULT_CONFIG.serviceUuid] },
-        ],
-        optionalServices: [DEFAULT_CONFIG.serviceUuid],
-      });
+      // Estrategia de solicitud robusta:
+      // Primero intentamos con filtro amplio o acceptAllDevices para máxima compatibilidad con cualquier firmware ESP32
+      let device: any = null;
+
+      try {
+        device = await (navigator as any).bluetooth.requestDevice({
+          filters: [
+            { name: DEFAULT_CONFIG.advertisedName },
+            { namePrefix: 'ESP32' },
+            { namePrefix: 'esp32' },
+            { services: [DEFAULT_CONFIG.serviceUuid] },
+          ],
+          optionalServices: [
+            DEFAULT_CONFIG.serviceUuid,
+            'generic_access',
+            'generic_attribute',
+          ],
+        });
+      } catch (filterErr: any) {
+        // Si el filtro específico falla o fue cancelado por no ver el nombre exacto, 
+        // probamos acceptAllDevices (permite al usuario elegir cualquier BLE visible)
+        if (filterErr.name !== 'NotFoundError') {
+          throw filterErr;
+        }
+
+        console.log('Filtro por nombre no encontró el dispositivo, intentando con acceptAllDevices...');
+        device = await (navigator as any).bluetooth.requestDevice({
+          acceptAllDevices: true,
+          optionalServices: [
+            DEFAULT_CONFIG.serviceUuid,
+            'generic_access',
+            'generic_attribute',
+          ],
+        });
+      }
+
+      if (!device) {
+        this.onStatusChangeCallback?.('disconnected', 'No se seleccionó ningún dispositivo');
+        return false;
+      }
 
       this.device = device;
-      this.onStatusChangeCallback?.('connecting', `Conectando con ${device.name || 'ESP32'}...`);
+      const deviceName = device.name || 'Dispositivo ESP32';
+      this.onStatusChangeCallback?.('connecting', `Conectando con ${deviceName}...`);
 
       device.addEventListener('gattserverdisconnected', this.handleDisconnection.bind(this));
 
       const server = await device.gatt.connect();
       this.server = server;
 
-      const service = await server.getPrimaryService(DEFAULT_CONFIG.serviceUuid);
-      this.characteristic = await service.getCharacteristic(DEFAULT_CONFIG.characteristicUuid);
+      // Descubrir servicio del motor
+      let service: any = null;
+      try {
+        service = await server.getPrimaryService(DEFAULT_CONFIG.serviceUuid);
+      } catch (serviceErr) {
+        console.warn('No se encontró el servicio con UUID primario exacto, explorando servicios disponibles...', serviceErr);
+        // Intentar obtener todos los servicios primarios para hallar la característica
+        const services = await server.getPrimaryServices();
+        for (const s of services) {
+          try {
+            const char = await s.getCharacteristic(DEFAULT_CONFIG.characteristicUuid);
+            if (char) {
+              service = s;
+              this.characteristic = char;
+              break;
+            }
+          } catch {
+            // continuar probando otros servicios
+          }
+        }
+      }
 
-      this.onStatusChangeCallback?.('connected', `Conectado a ${device.name || 'ESP32'}`);
+      if (!this.characteristic) {
+        if (!service) {
+          throw new Error(`No se encontró el servicio GATT (${DEFAULT_CONFIG.serviceUuid}). Revisa el código de tu ESP32.`);
+        }
+        this.characteristic = await service.getCharacteristic(DEFAULT_CONFIG.characteristicUuid);
+      }
+
+      this.onStatusChangeCallback?.('connected', `Conectado a ${deviceName}`);
       return true;
     } catch (err: any) {
       console.warn('BLE connect error:', err);
       if (err.name === 'NotFoundError') {
-        this.onStatusChangeCallback?.('disconnected', 'Búsqueda cancelada o no se seleccionó ningún dispositivo');
+        this.onStatusChangeCallback?.('disconnected', 'Búsqueda cancelada o no se seleccionó dispositivo');
       } else if (err.name === 'SecurityError') {
         this.onStatusChangeCallback?.(
           'error',
-          'Acceso a Bluetooth restringido por la política de seguridad del iframe. Abre la aplicación en una pestaña nueva o usa el modo Simulación.'
+          'Acceso a Bluetooth restringido por permisos o entorno iframe. Abre la aplicación en una pestaña nueva del navegador.'
         );
       } else if (err.name === 'NotSupportedError') {
-        this.onStatusChangeCallback?.('error', 'Web Bluetooth no está soportado en este sistema operativo/navegador.');
+        this.onStatusChangeCallback?.('error', 'Web Bluetooth no está soportado en este sistema operativo o navegador.');
       } else {
         this.onStatusChangeCallback?.('error', err.message || 'Error al conectar con el ESP32');
       }

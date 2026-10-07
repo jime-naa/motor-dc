@@ -9,6 +9,7 @@ import {
 import { bleService } from './services/bleService';
 import { BleConnectionPanel } from './components/BleConnectionPanel';
 import { MotorController } from './components/MotorController';
+import { RobotSimulator } from './components/RobotSimulator';
 import { CodeViewer } from './components/CodeViewer';
 import { WiringDiagram } from './components/WiringDiagram';
 import { ProtocolExplanation } from './components/ProtocolExplanation';
@@ -112,9 +113,7 @@ export default function App() {
       }
     );
 
-    // Conectar automáticamente al simulador virtual al iniciar
-    // para garantizar operatividad instantánea en entornos web e iframes
-    bleService.connectSimulator();
+    // Iniciar listo para conectar por Bluetooth o probar con simulador si el usuario lo desea
   }, []);
 
   // Handle command dispatch
@@ -241,16 +240,22 @@ export default function App() {
               isWebBleAvailable={bleService.isWebBleAvailable()}
             />
 
-            {/* 2. Interactive Motor Controller */}
-            <div className="max-w-2xl mx-auto w-full">
-              <MotorController
-                currentDirection={motorState.direction}
-                currentSpeed={motorState.speed}
-                lastCommand={lastCommand}
-                lastBytes={lastBytes}
-                isConnected={isConnected}
-                onSendCommand={handleSendCommand}
-              />
+            {/* 2. Interactive Motor Controller & Robot Simulator */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+              <div className="lg:col-span-6">
+                <MotorController
+                  currentDirection={motorState.direction}
+                  currentSpeed={motorState.speed}
+                  lastCommand={lastCommand}
+                  lastBytes={lastBytes}
+                  isConnected={isConnected}
+                  onSendCommand={handleSendCommand}
+                />
+              </div>
+
+              <div className="lg:col-span-6">
+                <RobotSimulator motorState={motorState} />
+              </div>
             </div>
 
             {/* 4. Live Transmission History Log */}
